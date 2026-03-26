@@ -1,32 +1,27 @@
 # Matching Engine
 
-A high-performance C++ limit order book matching engine built for ultra-low latency order processing - the core infrastructure behind every financial exchange.
+A C++ limit order book with price-time priority, FIX 4.2 parsing, and a lock-free ingestion queue.
 
-> **[X.X]M orders/sec** throughput · **[XXX]ns p99 latency** · price-time priority · FIX protocol · lock-free ingestion
-
----
+**13M inserts/sec · 6M matches/sec · 42ns p50 match latency** — Apple M1 Pro, Release build, single-threaded
 
 ## Performance
 
-Benchmarked on Apple M-series / Intel i7 (fill in your hardware), single-threaded matching loop, pinned to core 0.
+n=300k iterations per case, `-O3 -march=native`
 
-| Metric         | Result     |
-|----------------|------------|
-| Throughput     | [X.X]M ops/s |
-| p50 latency    | [XXX]ns    |
-| p95 latency    | [XXX]ns    |
-| p99 latency    | [XXX]ns    |
-| p99.9 latency  | [XXX]ns    |
+| Case | Throughput | p50 | p95 | p99 | p99.9 |
+|---|---|---|---|---|---|
+| insert (no match) | 13M ops/s | 42 ns | 125 ns | 167 ns | 1292 ns |
+| match (1:1 fill)  |  6M ops/s | 125 ns | 167 ns | 208 ns |  291 ns |
+| sweep (5-level)   |  1M ops/s | 667 ns | 709 ns | 792 ns | 5000 ns |
+| cancel            |  1M ops/s | 250 ns | 2000 ns | 4542 ns | 77000 ns |
 
-Run the benchmark yourself:
+The cancel tail is from scanning the price-level deque when orders share a price. An intrusive doubly-linked list would make cancel O(1) and kill the tail.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build -j$(nproc)
 ./build/bench/benchmark
 ```
-
----
 
 ## Architecture
 
@@ -59,38 +54,39 @@ cmake --build build
 └─────────────────────────────────────────────────────┘
 ```
 
----
-
 ## Features
 
-- **Price-time priority matching** - orders matched at best available price; ties broken by arrival time
-- **Limit and market orders** - limit orders rest in the book; market orders sweep available liquidity
-- **Lock-free SPSC ring buffer** - single-producer single-consumer queue between ingestion and matching threads; zero mutex contention on the hot path
-- **FIX protocol parser** - parses New Order Single (D) and Cancel Order (F) message types
-- **Market replay mode** - ingests historical tick data (CSV) and simulates order execution against real market sequences
-- **Latency harness** - measures p50/p95/p99/p99.9 using `std::chrono::steady_clock` with nanosecond resolution
+- Price-time priority — best price wins, ties broken by arrival order (FIFO per level)
+- Limit and market orders — market orders use a sentinel price that sweeps all available liquidity
+- Lock-free SPSC queue — ring buffer between parser/network thread and matching thread, no mutexes on the hot path
+- FIX 4.2 parser — decodes `NewOrderSingle` (35=D) and `OrderCancelRequest` (35=F), returns `std::variant<FIXNewOrder, FIXCancelRequest>`
+- Cancel index — `unordered_map<order_id, {side, price}>` for O(1) lookup before the deque scan
+- Market replay — reads historical tick CSV and replays against a live book
+- 20 unit tests — price priority, time priority, partial fills, multi-level sweeps, market orders, cancel, SPSC queue, FIX round-trips
 
----
+## Design decisions
 
-## Design Decisions
+**Integer prices, not floats**
 
-### Integer prices, not floats
-All prices are stored as 64-bit integers representing fixed-point values (e.g. price in cents). Floating-point arithmetic introduces representation errors that compound across millions of operations - a well-known source of bugs in financial systems. Every real exchange uses fixed-point arithmetic internally.
+Prices are `int64_t` in fixed-point cents ($150.05 → 15005). Floating-point errors are cumulative across millions of operations and have caused real production incidents. IEEE 754 doubles have 53 bits of mantissa — at typical equity prices that means sub-cent errors that compound. Every exchange I'm aware of uses integer fixed-point internally.
 
-### Lock-free SPSC queue
-The queue between the network/parser thread and the matching thread uses a single-producer single-consumer ring buffer backed by `std::atomic` with `memory_order_acquire/release` semantics. A mutex-based queue would force a kernel context switch on every order - costing ~1–10µs per operation. The lock-free alternative keeps everything in userspace and avoids false sharing by padding the head and tail pointers to separate cache lines.
+**Lock-free SPSC queue**
 
-### `std::map` for price levels
-The order book uses `std::map<int64_t, std::deque<Order>>` for both the bid and ask sides. This gives O(log n) insertion and O(1) best-price access (via `begin()`/`rbegin()`). The tradeoff versus a flat array or custom structure is simplicity and correctness first - a natural next step would be replacing this with a more cache-friendly structure for the top-of-book levels.
+A mutex-based queue incurs a kernel context switch on every push — roughly 1–10µs. The SPSC lock-free version stays entirely in userspace. Head and tail are on separate 64-byte cache lines to prevent false sharing: without the padding, every push invalidates the consumer's cache line and vice versa, effectively serialising the threads.
 
-### CPU affinity
-The matching thread is pinned to a single physical core via `pthread_setaffinity_np`. This eliminates OS-level context switching and ensures the L1/L2 caches stay warm for the order book data. Without pinning, benchmark results are noisy and p99 numbers are significantly worse.
+This follows Dmitry Vyukov's SPSC queue design. With a single producer and single consumer you never need more than acquire/release — seq_cst adds unnecessary fence instructions on ARM.
 
----
+**`std::map` for price levels**
+
+`std::map<int64_t, std::deque<Order>>` gives O(log n) insertion and O(1) best-price access via `begin()`. The tradeoff is pointer chasing through the red-black tree on every level traversal. A flat sorted array would be more cache-friendly since the number of distinct prices is usually small. I started with `std::map` to get the matching logic right before optimising.
+
+**Cancel index**
+
+Most matching engine writeups skip the cancel path, but in practice cancel rates can easily exceed new order rates (20:1 cancel-to-trade ratios are common in equities). The hash map gives O(1) lookup to find the right price level, then O(k) to scan the deque. In the benchmark the p99 tail on cancel comes from that scan when many orders share a price.
 
 ## Build
 
-**Requirements:** C++20, CMake 3.20+
+Requirements: C++20, CMake 3.20+
 
 ```bash
 git clone https://github.com/benduncanson/matching-engine
@@ -99,59 +95,62 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-**Run tests:**
+Run tests:
 ```bash
 ./build/tests/order_book_test
 ```
 
-**Run benchmark:**
+Run benchmark:
 ```bash
 ./build/bench/benchmark
 ```
 
-**Run market replay:**
+Run market replay:
 ```bash
 ./build/src/matching_engine --replay data/sample_ticks.csv
 ```
 
----
+Debug build (AddressSanitizer + UBSan):
+```bash
+cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug
+./build-debug/tests/order_book_test
+```
 
-## Project Structure
+## Project structure
 
 ```
 matching-engine/
 ├── include/
-│   ├── order.h           # Order and Fill structs
+│   ├── order.h           # Order struct + Side/OrderType enums
+│   ├── trade.h           # Trade (fill) struct
 │   ├── order_book.h      # OrderBook class
 │   ├── spsc_queue.h      # Lock-free ring buffer
-│   └── fix_parser.h      # FIX protocol parser
+│   └── fix_parser.h      # FIX 4.2 message types + parser
 ├── src/
-│   ├── order_book.cpp
-│   ├── fix_parser.cpp
-│   └── main.cpp
+│   ├── order_book.cpp    # Matching core + cancel
+│   ├── fix_parser.cpp    # Tag extraction + message decode
+│   └── main.cpp          # Demo mode + --replay mode
 ├── tests/
-│   └── order_book_test.cpp
+│   └── order_book_test.cpp   # 20 unit tests (no external framework)
 ├── bench/
-│   └── benchmark.cpp
+│   └── benchmark.cpp     # p50/p95/p99/p99.9 latency harness
 ├── data/
 │   └── sample_ticks.csv  # Sample tick data for replay
 └── CMakeLists.txt
 ```
 
----
-
 ## What I'd do next
 
-- **Custom allocator** - replace `new`/`delete` on the order path with a pool allocator to eliminate heap allocation latency
-- **Intrusive linked lists** - replace `std::deque` at each price level with an intrusive list to improve cache locality
-- **Multi-symbol support** - route orders to per-symbol books via a symbol table; each book runs on its own thread
-- **Full FIX session layer** - add logon/logout, heartbeat, and sequence number tracking for a complete FIX 4.2 session
-
----
+- Intrusive linked list at each price level — eliminates the O(k) cancel scan
+- Pool allocator — `std::deque` and `std::map` nodes hit the general allocator on every order; a slab allocator would shave 30–50ns off the insert path
+- Multi-symbol routing — `robin_hood::unordered_map<Symbol, OrderBook>` dispatching to per-symbol books on their own threads
+- Top-of-book cache — cache `best_bid`/`best_ask` as atomics so market data subscribers don't contend with the matching thread
+- Full FIX session layer — logon/logout, heartbeat (35=0), sequence numbers and gap-fill
 
 ## References
 
-- [LOBSTER tick data](https://lobsterdata.com/) - source for sample market replay data
-- [Fix Protocol spec](https://www.fixtrading.org/standards/) - FIX 4.2 message reference
-- Corbet & Gregg, *Linux kernel lock-free data structures*
-- Nasdaq TotalView-ITCH 5.0 specification
+- Nasdaq TotalView-ITCH 5.0 spec — canonical description of how a real exchange encodes its order book feed
+- [FIX Protocol specification](https://www.fixtrading.org/standards/) — FIX 4.2 message reference
+- [LOBSTER market data](https://lobsterdata.com/) — reconstructed limit order book data for realistic replay testing
+- Dmitry Vyukov, *Single-Producer Single-Consumer Queue* (2010)
